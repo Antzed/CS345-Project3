@@ -80,6 +80,20 @@ type Raft struct {
 	heartbeatInterval    time.Duration
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReplay struct {
+	Term    int
+	Success bool
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
