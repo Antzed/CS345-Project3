@@ -173,10 +173,10 @@ func (rf *Raft) lastLogIndex() int {
 }
 
 func (rf *Raft) lastLogTerm() int {
-	if len(rf.log) > 1 {
-		return rf.log[len(rf.log)-1].Term
+	if len(rf.log) == 0 {
+		return 0
 	}
-	return 0
+	return rf.log[len(rf.log)-1].Term
 }
 
 // example RequestVote RPC handler.
@@ -252,7 +252,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	default:
 	}
 
-	if args.PrevLogIndex > rf.lastLogIndex() || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.log) ||
+		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
@@ -338,17 +339,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	index := -1
-	term := rf.currentTerm
-	isLeader := rf.state == Leader
-	if !isLeader {
-		return index, term, false
+
+	if rf.state != Leader {
+		return -1, rf.currentTerm, false
 	}
 
-	index = rf.lastLogIndex() + 1
-	rent := rf.currentTerm
-	rf.log = append(rf.log, LogEntry{Term: rent, Command: command})
+	index := rf.lastLogIndex() + 1
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	rf.persist()
+	term := rf.currentTerm
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -519,46 +518,61 @@ func (rf *Raft) startElection() {
 
 	//wait for majoirty or lapse
 	muVotes.Lock()
-	for votes*2 <= nPeers && rf.currentTerm == termStarted {
+	for votes*2 <= nPeers {
+		rf.mu.Lock()
+		if rf.currentTerm != termStarted || rf.state != Candidate {
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
 		cond.Wait()
 	}
 
-	if votes*2 > nPeers && rf.currentTerm == termStarted {
+	if votes*2 > nPeers {
 		rf.mu.Lock()
-		rf.state = Leader
-		//is leader now, initialize leader state
-		next := rf.lastLogIndex() + 1
-		for i := range nPeers {
-			rf.nextIndex[i] = next
-			rf.matchIndex[i] = 0
+		if rf.currentTerm == termStarted || rf.state != Candidate {
+			rf.state = Leader
+			next := rf.lastLogIndex() + 1
+			for i := range rf.peers {
+				rf.nextIndex[i] = next
+				rf.matchIndex[i] = 0
+			}
 		}
-		rf.mu.Unlock()
 		//send emepty appending entries
 		select {
 		case rf.resetElectionTimerCh <- struct{}{}:
 		default:
 		}
+		rf.mu.Unlock()
 	}
 	muVotes.Unlock()
 
 }
 
 func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
-	// impelment this
-	reply := &AppendEntriesReply{}
-	if rf.sendAppendEntries(server, args, reply) {
+
+	for {
+		reply := &AppendEntriesReply{}
+		if !rf.sendAppendEntries(server, args, reply) {
+			return
+		}
+
 		rf.mu.Lock()
-		defer rf.mu.Unlock()
+
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 			rf.state = Follower
 			rf.votedFor = -1
 			rf.persist()
+			rf.mu.Unlock()
 			return
 		}
+
 		if rf.state != Leader || args.Term != rf.currentTerm {
+			rf.mu.Unlock()
 			return
 		}
+
 		if reply.Success {
 			n := args.PrevLogIndex + len(args.Entries)
 			rf.matchIndex[server] = n
@@ -571,32 +585,90 @@ func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
 						count++
 					}
 				}
-				//if more than half updated to N, and term is current time, apply the log
 				if count*2 > len(rf.peers) && rf.log[N].Term == rf.currentTerm {
 					rf.commitIndex = N
-
 					for rf.lastApplied < rf.commitIndex {
 						rf.lastApplied++
-						applyMsg := ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.lastApplied}
+						applyMsg := ApplyMsg{
+							CommandValid: true,
+							Command:      rf.log[rf.lastApplied].Command,
+							CommandIndex: rf.lastApplied,
+						}
 						rf.mu.Unlock()
 						rf.applyCh <- applyMsg
 						rf.mu.Lock()
 					}
 				}
 			}
+			rf.mu.Unlock()
+			return
 		} else {
 			rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
 			prev := rf.nextIndex[server] - 1
-
 			args.Term = rf.currentTerm
 			args.PrevLogIndex = prev
 			args.PrevLogTerm = rf.log[prev].Term
 			args.Entries = rf.log[prev+1:]
-			go rf.leaderSendEntries(server, args)
-
+			rf.mu.Unlock()
 		}
 	}
+
 }
+
+// func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
+// 	// impelment this
+// 	reply := &AppendEntriesReply{}
+// 	if rf.sendAppendEntries(server, args, reply) {
+// 		rf.mu.Lock()
+// 		defer rf.mu.Unlock()
+// 		if reply.Term > rf.currentTerm {
+// 			rf.currentTerm = reply.Term
+// 			rf.state = Follower
+// 			rf.votedFor = -1
+// 			rf.persist()
+// 			return
+// 		}
+// 		if rf.state != Leader || args.Term != rf.currentTerm {
+// 			return
+// 		}
+// 		if reply.Success {
+// 			n := args.PrevLogIndex + len(args.Entries)
+// 			rf.matchIndex[server] = n
+// 			rf.nextIndex[server] = n + 1
+
+// 			for N := rf.commitIndex + 1; N <= rf.lastLogIndex(); N++ {
+// 				count := 1
+// 				for i := range rf.peers {
+// 					if i != rf.me && rf.matchIndex[i] >= N {
+// 						count++
+// 					}
+// 				}
+// 				//if more than half updated to N, and term is current time, apply the log
+// 				if count*2 > len(rf.peers) && rf.log[N].Term == rf.currentTerm {
+// 					rf.commitIndex = N
+
+// 					for rf.lastApplied < rf.commitIndex {
+// 						rf.lastApplied++
+// 						applyMsg := ApplyMsg{true, rf.log[rf.lastApplied].Command, rf.lastApplied}
+// 						rf.mu.Unlock()
+// 						rf.applyCh <- applyMsg
+// 						rf.mu.Lock()
+// 					}
+// 				}
+// 			}
+// 		} else {
+// 			rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
+// 			prev := rf.nextIndex[server] - 1
+
+// 			args.Term = rf.currentTerm
+// 			args.PrevLogIndex = prev
+// 			args.PrevLogTerm = rf.log[prev].Term
+// 			args.Entries = rf.log[prev+1:]
+// 			go rf.leaderSendEntries(server, args)
+
+// 		}
+// 	}
+// }
 
 // min helper
 func min(a, b int) int {
